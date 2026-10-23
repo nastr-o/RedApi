@@ -90,3 +90,18 @@ curl "http://localhost:8080/raw/r/python/top?t=week"
 - `cache.py` - tiny TTL cache (fresh + stale reads)
 - `reddit_client.py` - the actual client + fallback chain
 - `main.py` - FastAPI routes
+
+## DemandLark fork notes (2026-10-23)
+
+Reddit closed logged-out access on 2026-10-22: public `*.json` answers 403 or redirects to a login page, and reads made
+with the old anonymous `installed_client` token, or with a non-browser TLS handshake, answer 403 "blocked by network
+security". Following the note in `config.py` (take the current approach from Redlib), this fork:
+
+- gets the logged-out token from the Android app's loid endpoint (`/auth/v2/oauth/access-token/loid`), as Redlib's
+  `MobileSpoofAuth` does, and sends back the `x-reddit-loid` / `x-reddit-session` headers and the app's device headers;
+- talks to Reddit through `curl_cffi` with a browser TLS profile (Redlib uses `wreq` emulation for the same reason);
+- encodes the comments separator (`/r/sub%2Fcomments/id`) like Redlib.
+
+Verified 2026-10-23: listings, search, subreddit about/rules, `/by_id` and `/duplicates` answer 200. Comment threads
+still answer 403. For development and proof-of-concept use only: low request volume, to be replaced by the official
+Reddit Data API before any launch.

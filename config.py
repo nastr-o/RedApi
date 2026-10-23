@@ -27,6 +27,7 @@ IMPORTANT — read before deploying:
 """
 
 import random
+import uuid
 
 # --- OAuth "installed client" identities ------------------------------------
 # device_id is regenerated once per process (random UUID4) -- matches what the
@@ -225,6 +226,12 @@ DESKTOP_USER_AGENTS = [
 # Order = fallback priority. The client walks down this list whenever a tier
 # fails outright (transport error / persistent 403 / exhausted retries).
 OAUTH_TOKEN_URL = "https://www.reddit.com/api/v1/access_token"
+# The Android app's current logged-out token endpoint (what Redlib's MobileSpoofAuth uses, src/oauth.rs).
+LOID_TOKEN_URL = "https://www.reddit.com/auth/v2/oauth/access-token/loid"
+
+# TLS fingerprints to present (curl_cffi impersonation targets). Reddit's edge blocks non-browser handshakes; Redlib
+# emulates Chrome/Firefox for the same reason (src/client.rs).
+TLS_IMPERSONATE = ["chrome", "firefox"]
 
 FALLBACK_TIERS = [
     {"name": "oauth", "base": "https://oauth.reddit.com", "auth": True},
@@ -241,3 +248,19 @@ REQUEST_TIMEOUT = 10.0
 
 CACHE_TTL_SECONDS = 10  # short-lived cache to absorb bursts of identical calls
 CACHE_STALE_MAX_SECONDS = 600  # serve-stale-on-total-failure window
+
+
+def android_app_headers() -> dict:
+    """Headers the Android app sends, as Redlib builds them (src/oauth.rs, Device::android): one device id per
+    process, reused for the token request and every read."""
+    device_id = str(uuid.uuid4())
+    return {
+        "User-Agent": random_android_user_agent(),
+        "x-reddit-retry": "algo=no-retries",
+        "x-reddit-compression": "1",
+        "x-reddit-qos": f"{random.uniform(1, 100):.3f}",
+        "x-reddit-media-codecs": "available-codecs=video/avc, video/hevc",
+        "Content-Type": "application/json; charset=UTF-8",
+        "client-vendor-id": device_id,
+        "X-Reddit-Device-Id": device_id,
+    }

@@ -37,15 +37,36 @@ fixing Libreddit's rate-limit problems):
 """
 
 import asyncio
+import json
 import random
 import time
 import uuid
 from typing import Any, Optional
 
-import httpx
+from curl_cffi import requests as cffi
+from curl_cffi.requests.exceptions import RequestException
 
 import config
 from cache import TTLCache
+
+
+def comments_transport_path(path: str) -> str:
+    """Encode one separator in a comments route, as Redlib does (src/client.rs, comments_transport_path): Reddit blocks
+    literal anonymous comments routes, so "/r/sub/comments/id" goes out as "/r/sub%2Fcomments/id" and "/comments/id" as
+    "/comments%2Fid". Every other path is unchanged."""
+    if path.startswith("/comments/"):
+        separator = len("/comments")
+    elif path.startswith("/r/"):
+        subreddit, _, rest = path[3:].partition("/")
+        if not subreddit or not rest.startswith("comments/"):
+            return path
+        separator = 3 + len(subreddit)
+    else:
+        return path
+    post_id = path[separator + 1:].split("/")[0] if path.startswith("/comments/") else path[separator + 1:].split("/")[1]
+    if not post_id or post_id == ".json":
+        return path
+    return f"{path[:separator]}%2F{path[separator + 1:]}"
 
 
 class RedditAPIError(Exception):
@@ -69,15 +90,24 @@ class _Token:
 
 class RedditClient:
     def __init__(self) -> None:
-        self._http = httpx.AsyncClient(timeout=config.REQUEST_TIMEOUT)
+        # Reddit's edge ("blocked by network security") rejects clients by their TLS fingerprint, so requests go out with
+        # a real browser's handshake, as Redlib does with wreq's emulation profiles.
+        self._http = cffi.AsyncSession(
+            impersonate=random.choice(config.TLS_IMPERSONATE),
+            timeout=config.REQUEST_TIMEOUT,
+            allow_redirects=False,
+        )
         self._token: Optional[_Token] = None
+        # Session headers Reddit returns with a loid token; sent back on every authenticated read.
+        self._session_headers: dict[str, str] = {}
+        self._app_headers = config.android_app_headers()
         self._token_lock = asyncio.Lock()
         self._device_id = str(uuid.uuid4())
         self._client_id_index = 0
         self._cache = TTLCache()
 
     async def aclose(self) -> None:
-        await self._http.aclose()
+        await self._http.close()
 
     # ---------------------------------------------------------------- token
 
@@ -88,8 +118,36 @@ class RedditClient:
         self._client_id_index += 1
 
     async def _fetch_token(self, client_id: str) -> _Token:
-        """Anonymous 'installed_client' grant -- same flow the official
-        Android app uses for logged-out browsing. No username/password."""
+        """Logged-out token the way Redlib gets it today: the Android app's loid endpoint first, the older
+        installed_client grant as a fallback."""
+        try:
+            return await self._fetch_loid_token(client_id)
+        except (RedditAPIError, RequestException, ValueError, KeyError):
+            return await self._fetch_installed_client_token(client_id)
+
+    async def _fetch_loid_token(self, client_id: str) -> _Token:
+        resp = await self._http.post(
+            config.LOID_TOKEN_URL,
+            headers=self._app_headers,
+            auth=(client_id, ""),
+            data=json.dumps({"scopes": ["*", "email", "pii"]}),
+        )
+        if resp.status_code != 200:
+            raise RedditAPIError(f"loid token request failed ({resp.status_code})", status_code=resp.status_code)
+        payload = resp.json()
+        self._session_headers = {
+            name: resp.headers[name] for name in ("x-reddit-loid", "x-reddit-session") if resp.headers.get(name)
+        }
+        return _Token(
+            value=payload["access_token"],
+            expires_in=payload.get("expires_in", config.TOKEN_LIFETIME_SECONDS),
+            client_id=client_id,
+        )
+
+    async def _fetch_installed_client_token(self, client_id: str) -> _Token:
+        """Anonymous 'installed_client' grant -- the flow the official
+        Android app used for logged-out browsing. No username/password."""
+        self._session_headers = {}
         headers = {
             "User-Agent": config.random_android_user_agent(),
             "Content-Type": "application/x-www-form-urlencoded",
@@ -127,34 +185,37 @@ class RedditClient:
                 try:
                     self._token = await self._fetch_token(client_id)
                     return self._token
-                except (RedditAPIError, httpx.HTTPError) as exc:
+                except (RedditAPIError, RequestException) as exc:
                     last_error = exc
                     self._rotate_client_id()  # this id looks burnt, try next
             raise RedditAPIError(f"all OAuth client ids failed: {last_error}")
 
     # ------------------------------------------------------------- requests
 
-    async def _request_oauth(self, path: str, params: dict) -> httpx.Response:
+    async def _request_oauth(self, path: str, params: dict) -> cffi.Response:
         token = await self._get_token()
         headers = {
+            **self._app_headers,
+            **self._session_headers,
             "Authorization": f"Bearer {token.value}",
-            "User-Agent": config.random_android_user_agent(),
         }
-        url = f"{config.FALLBACK_TIERS[0]['base']}{path}"
+        headers.pop("Content-Type", None)
+        url = f"{config.FALLBACK_TIERS[0]['base']}{comments_transport_path(path)}"
         resp = await self._http.get(url, params=params, headers=headers)
         if resp.status_code in (401, 403):
             # token likely expired/revoked early -- refresh once and retry
             token = await self._get_token(force_refresh=True)
+            headers.update(self._session_headers)
             headers["Authorization"] = f"Bearer {token.value}"
             resp = await self._http.get(url, params=params, headers=headers)
         return resp
 
-    async def _request_public_json(self, base: str, path: str, params: dict) -> httpx.Response:
+    async def _request_public_json(self, base: str, path: str, params: dict) -> cffi.Response:
         headers = {"User-Agent": random.choice(config.DESKTOP_USER_AGENTS)}
         url = f"{base}{path}"
         return await self._http.get(url, params=params, headers=headers)
 
-    async def _request_tier(self, tier: dict, path: str, params: dict) -> httpx.Response:
+    async def _request_tier(self, tier: dict, path: str, params: dict) -> cffi.Response:
         if tier["auth"]:
             return await self._request_oauth(path, params)
         return await self._request_public_json(tier["base"], path, params)
@@ -178,7 +239,7 @@ class RedditClient:
             for attempt in range(config.MAX_RETRIES_PER_TIER):
                 try:
                     resp = await self._request_tier(tier, path, params)
-                except httpx.HTTPError as exc:
+                except RequestException as exc:
                     last_detail = f"{tier['name']} transport error: {exc}"
                     await asyncio.sleep(config.BACKOFF_BASE_SECONDS * (2 ** attempt))
                     continue
