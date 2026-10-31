@@ -246,6 +246,11 @@ MAX_RETRIES_PER_TIER = 3
 BACKOFF_BASE_SECONDS = 0.75
 REQUEST_TIMEOUT = 10.0
 
+# Self-healing (reddit_client._self_heal): listing/search reads refused this many times in a row, each with a fresh
+# identity, make the process exit so Render starts a new instance; never sooner than this after a start.
+REFUSALS_BEFORE_RESTART = 4
+MIN_UPTIME_BEFORE_RESTART = 5 * 60
+
 CACHE_TTL_SECONDS = 10  # short-lived cache to absorb bursts of identical calls
 CACHE_STALE_MAX_SECONDS = 600  # serve-stale-on-total-failure window
 

@@ -47,8 +47,16 @@ async def _fetch(path: str, params: Optional[dict] = None):
 
 
 @app.api_route("/health", methods=["GET", "HEAD"])
-async def health():
-    return {"status": "ok - checked by @exilonium"}
+async def health(deep: bool = False):
+    if not deep:
+        return {"status": "ok - checked by @exilonium"}
+    # deep=1: is Reddit readable from this instance right now? One small listing read (cached 10 s).
+    try:
+        await reddit_client.get("/r/announcements/new", {"limit": 1})
+        readable, detail = True, None
+    except RedditAPIError as exc:
+        readable, detail = False, str(exc)[:300]
+    return {"status": "ok", "redditReadable": readable, "detail": detail, **reddit_client.status()}
 
 
 @app.get("/r/{subreddit}/{sort}")

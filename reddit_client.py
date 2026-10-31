@@ -38,6 +38,7 @@ fixing Libreddit's rate-limit problems):
 
 import asyncio
 import json
+import os
 import re
 import random
 import time
@@ -90,10 +91,27 @@ class _Token:
         return time.monotonic() < (self.expires_at - config.TOKEN_SAFETY_MARGIN)
 
 
+def _is_comments_path(path: str) -> bool:
+    """Reddit refuses anonymous comments reads on their own while listings and search work, so a refused comments read
+    says nothing about this instance being blocked."""
+    return "/comments/" in path or path.startswith("/comments")
+
+
 class RedditClient:
     def __init__(self) -> None:
-        # Reddit's edge ("blocked by network security") rejects clients by their TLS fingerprint, so requests go out with
-        # a real browser's handshake, as Redlib does with wreq's emulation profiles.
+        self._started = time.monotonic()
+        self._token_lock = asyncio.Lock()
+        self._client_id_index = 0
+        self._cache = TTLCache()
+        # Listing/search/about reads refused on the oauth tier in a row (each after a fresh identity); see _self_heal.
+        self._refused_in_a_row = 0
+        self._exit_scheduled = False
+        self._new_identity()
+
+    def _new_identity(self) -> None:
+        """A fresh device: browser TLS profile, connection pool, app headers, device id and token. Reddit's edge
+        ("blocked by network security") rejects clients by their TLS fingerprint, so requests go out with a real
+        browser's handshake, as Redlib does with wreq's emulation profiles."""
         self._http = cffi.AsyncSession(
             impersonate=random.choice(config.TLS_IMPERSONATE),
             timeout=config.REQUEST_TIMEOUT,
@@ -103,13 +121,39 @@ class RedditClient:
         # Session headers Reddit returns with a loid token; sent back on every authenticated read.
         self._session_headers: dict[str, str] = {}
         self._app_headers = config.android_app_headers()
-        self._token_lock = asyncio.Lock()
         self._device_id = str(uuid.uuid4())
-        self._client_id_index = 0
-        self._cache = TTLCache()
+
+    async def _reset_identity(self) -> None:
+        old = self._http
+        self._new_identity()
+        try:
+            await old.close()
+        except Exception:  # an already broken session must not stop the reset
+            pass
+
+    def _self_heal(self) -> None:
+        """2026-10-31: one instance was refused on every read all morning while the same code read fine from elsewhere and
+        from a fresh instance. When listing/search reads keep being refused even with a fresh identity, exit so Render
+        starts a new instance. Never in the first minutes after a start, so a real outage can't become a crash loop."""
+        if self._exit_scheduled or self._refused_in_a_row < config.REFUSALS_BEFORE_RESTART:
+            return
+        if time.monotonic() - self._started < config.MIN_UPTIME_BEFORE_RESTART:
+            return
+        self._exit_scheduled = True
+        print(f"redapi: {self._refused_in_a_row} reads refused in a row with fresh identities; restarting", flush=True)
+        asyncio.get_running_loop().call_later(2, os._exit, 3)
 
     async def aclose(self) -> None:
         await self._http.close()
+
+    def status(self) -> dict:
+        """What /health?deep=1 reports: no secrets, only whether reads are being refused."""
+        token = self._token
+        return {
+            "refusedInARow": self._refused_in_a_row,
+            "tokenFlow": token.flow if token else None,
+            "uptimeSeconds": int(time.monotonic() - self._started),
+        }
 
     # ---------------------------------------------------------------- token
 
@@ -254,6 +298,8 @@ class RedditClient:
                 snippet = " ".join(re.sub(r"<[^>]*>|\{[^}]*\}", " ", resp.text or "").split())[:80]
             trail.append(f"{label}:{resp.status_code} {snippet[:80]}".strip())
 
+        counts = not _is_comments_path(path)
+        identity_reset = False
         for tier in config.FALLBACK_TIERS:
             for attempt in range(config.MAX_RETRIES_PER_TIER):
                 try:
@@ -265,6 +311,8 @@ class RedditClient:
                     continue
 
                 if resp.status_code == 200:
+                    if tier["auth"] and counts:
+                        self._refused_in_a_row = 0
                     try:
                         data = resp.json()
                     except ValueError:
@@ -288,6 +336,14 @@ class RedditClient:
                     last_status = resp.status_code
                     last_detail = f"{tier['name']} returned {resp.status_code}"
                     note(tier["name"], resp)
+                    if tier["auth"] and counts and not identity_reset:
+                        # Refused even after a token refresh: try once more as a brand-new device.
+                        identity_reset = True
+                        await self._reset_identity()
+                        continue
+                    if tier["auth"] and counts:
+                        self._refused_in_a_row += 1
+                        self._self_heal()
                     break  # next tier, retrying here won't help
 
                 if 500 <= resp.status_code < 600:
