@@ -38,6 +38,7 @@ fixing Libreddit's rate-limit problems):
 
 import asyncio
 import json
+import re
 import random
 import time
 import uuid
@@ -76,10 +77,11 @@ class RedditAPIError(Exception):
 
 
 class _Token:
-    __slots__ = ("value", "expires_at", "client_id")
+    __slots__ = ("value", "expires_at", "client_id", "flow")
 
-    def __init__(self, value: str, expires_in: int, client_id: str):
+    def __init__(self, value: str, expires_in: int, client_id: str, flow: str = "installed_client"):
         self.value = value
+        self.flow = flow
         self.expires_at = time.monotonic() + expires_in
         self.client_id = client_id
 
@@ -142,6 +144,7 @@ class RedditClient:
             value=payload["access_token"],
             expires_in=payload.get("expires_in", config.TOKEN_LIFETIME_SECONDS),
             client_id=client_id,
+            flow="loid",
         )
 
     async def _fetch_installed_client_token(self, client_id: str) -> _Token:
@@ -234,6 +237,22 @@ class RedditClient:
 
         last_status = 502
         last_detail = "unknown error"
+        # One entry per failed attempt, e.g. "oauth(loid):403 blocked by network security", so an outage says which
+        # tier failed and how, not just the last fallback's answer.
+        trail: list[str] = []
+
+        def note(tier_name: str, resp: Any = None, error: str = "") -> None:
+            label = tier_name
+            if tier_name == "oauth" and self._token is not None:
+                label = f"oauth({self._token.flow})"
+            if resp is None:
+                trail.append(f"{label}:{error}"[:120])
+                return
+            snippet = " ".join((resp.text or "")[:200].split())
+            if "<" in snippet:  # an HTML block page: keep only its readable words
+
+                snippet = " ".join(re.sub(r"<[^>]*>|\{[^}]*\}", " ", resp.text or "").split())[:80]
+            trail.append(f"{label}:{resp.status_code} {snippet[:80]}".strip())
 
         for tier in config.FALLBACK_TIERS:
             for attempt in range(config.MAX_RETRIES_PER_TIER):
@@ -241,6 +260,7 @@ class RedditClient:
                     resp = await self._request_tier(tier, path, params)
                 except RequestException as exc:
                     last_detail = f"{tier['name']} transport error: {exc}"
+                    note(tier["name"], error=f"transport {type(exc).__name__}")
                     await asyncio.sleep(config.BACKOFF_BASE_SECONDS * (2 ** attempt))
                     continue
 
@@ -249,6 +269,7 @@ class RedditClient:
                         data = resp.json()
                     except ValueError:
                         last_detail = f"{tier['name']} returned non-JSON body"
+                        note(tier["name"], resp)
                         break  # don't retry a parse failure, just try next tier
                     self._cache.set(cache_key, data)
                     return data
@@ -258,17 +279,21 @@ class RedditClient:
                         config.BACKOFF_BASE_SECONDS * (2 ** attempt)
                     )
                     last_status, last_detail = 429, f"{tier['name']} rate limited"
+                    note(tier["name"], resp)
                     await asyncio.sleep(retry_after)
                     continue
 
-                if resp.status_code in (401, 403):
+                if resp.status_code in (401, 403) or 300 <= resp.status_code < 400:
+                    # 401/403, or a redirect to the login page: this tier is refused; try the next one.
                     last_status = resp.status_code
-                    last_detail = f"{tier['name']} forbidden"
+                    last_detail = f"{tier['name']} returned {resp.status_code}"
+                    note(tier["name"], resp)
                     break  # next tier, retrying here won't help
 
                 if 500 <= resp.status_code < 600:
                     last_status = resp.status_code
                     last_detail = f"{tier['name']} server error {resp.status_code}"
+                    note(tier["name"], resp)
                     await asyncio.sleep(config.BACKOFF_BASE_SECONDS * (2 ** attempt))
                     continue
 
@@ -283,7 +308,7 @@ class RedditClient:
         if stale is not None:
             return stale
 
-        raise RedditAPIError(f"all tiers failed: {last_detail}", status_code=last_status)
+        raise RedditAPIError(f"all tiers failed: {' | '.join(trail) or last_detail}", status_code=last_status)
 
 
 reddit_client = RedditClient()
