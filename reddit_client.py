@@ -49,6 +49,7 @@ from curl_cffi import requests as cffi
 from curl_cffi.requests.exceptions import RequestException
 
 import config
+import reddit_gql
 from cache import TTLCache
 
 
@@ -69,6 +70,21 @@ def comments_transport_path(path: str) -> str:
     if not post_id or post_id == ".json":
         return path
     return f"{path[:separator]}%2F{path[separator + 1:]}"
+
+
+class _GraphQLFailed(Exception):
+    """GraphQL gave no comment forest; the message says why (status and a short snippet, or the error codes)."""
+
+
+def _escape_bodies(listing: Any) -> None:
+    """Escape comment bodies the way the JSON API does without raw_json=1 (&amp; &lt; &gt;)."""
+    for child in ((listing or {}).get("data") or {}).get("children") or []:
+        data = child.get("data") or {}
+        if child.get("kind") == "t1":
+            body = data.get("body") or ""
+            data["body"] = body.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            if isinstance(data.get("replies"), dict):
+                _escape_bodies(data["replies"])
 
 
 class RedditAPIError(Exception):
@@ -269,12 +285,102 @@ class RedditClient:
 
     async def get(self, path: str, params: Optional[dict] = None) -> Any:
         """Fetch a Reddit JSON resource by path, e.g. '/r/python/hot',
-        walking the full fallback chain. Returns parsed JSON."""
+        walking the full fallback chain. Returns parsed JSON. Comment threads go through GraphQL (_get_thread)."""
         params = dict(params or {})
         if not path.endswith(".json"):
             path = f"{path}.json"
 
         cache_key = f"{path}?{sorted(params.items())}"
+        cached = self._cache.get_fresh(cache_key, config.CACHE_TTL_SECONDS)
+        if cached is not None:
+            return cached
+
+        thread = reddit_gql.parse_thread_path(path)
+        if thread is not None:
+            return await self._get_thread(path, params, thread, cache_key)
+        return await self._get_chain(path, params, cache_key, counts=not _is_comments_path(path))
+
+    # --------------------------------------------------------- comment threads
+
+    async def _graphql(self, body: dict) -> Any:
+        """POST one persisted query to gql-fed.reddit.com with the app's token and headers. A refused or rate-limited
+        token is replaced once; an answer without a comment forest (upstream timeouts come back as null fields) is
+        asked again once. Raises _GraphQLFailed with a short reason."""
+        last = "no answer"
+        for attempt in range(2):
+            token = await self._get_token(force_refresh=attempt > 0 and last.startswith(("401", "403", "429")))
+            headers = {
+                **self._app_headers,
+                **self._session_headers,
+                "Authorization": f"Bearer {token.value}",
+                "Content-Type": "application/json; charset=UTF-8",
+            }
+            try:
+                resp = await self._http.post(reddit_gql.GQL_URL, headers=headers, data=json.dumps(body))
+            except RequestException as exc:
+                last = f"transport {type(exc).__name__}"
+                continue
+            remaining = resp.headers.get("x-ratelimit-remaining")
+            try:
+                if remaining is not None and float(remaining) < 5:
+                    self._token = None  # GraphQL allows ~600 queries per token; the next read gets a fresh one
+            except ValueError:
+                pass
+            if resp.status_code != 200:
+                snippet = " ".join(re.sub(r"<style.*?</style>|<[^>]*>", " ", resp.text or "", flags=re.S).split())
+                last = f"{resp.status_code} {snippet[:80]}".strip()
+                continue
+            try:
+                data = resp.json()
+            except ValueError:
+                last = "200 non-JSON body"
+                continue
+            if reddit_gql.comment_trees(data) is not None:
+                return data
+            errors = data.get("errors") if isinstance(data, dict) else None
+            codes = [((e or {}).get("extensions") or {}).get("code") or (e or {}).get("message") for e in errors or []]
+            last = f"no comments ({', '.join(str(c) for c in codes if c)[:80] or 'empty'})"
+        raise _GraphQLFailed(last)
+
+    async def _get_thread(self, path: str, params: dict, thread: dict, cache_key: str) -> Any:
+        """A comments route as Reddit's JSON shape, [postListing, commentListing]: the post from /by_id, the comments
+        from GraphQL's PostComments (Reddit's edge refuses the comments JSON routes for logged-out tokens). When GraphQL
+        fails, the old JSON route is tried as before. Neither ever counts toward the self-heal restart."""
+        post_id, comment_id = thread["post_id"], thread["comment_id"]
+        body = reddit_gql.request_body(reddit_gql.variables(post_id, comment_id, params))
+        post_result, gql_result = await asyncio.gather(
+            self._get_chain(f"/by_id/t3_{post_id}.json", {}, f"/by_id/t3_{post_id}.json?[]", counts=False),
+            self._graphql(body),
+            return_exceptions=True,
+        )
+        if isinstance(post_result, RedditAPIError):
+            raise post_result
+        if isinstance(post_result, BaseException):
+            raise RedditAPIError(f"post read failed: {type(post_result).__name__}")
+        children = ((post_result or {}).get("data") or {}).get("children") if isinstance(post_result, dict) else None
+        if not children:
+            raise RedditAPIError(f"post {post_id} not found", status_code=404)
+
+        if isinstance(gql_result, BaseException):
+            reason = str(gql_result) if isinstance(gql_result, _GraphQLFailed) else type(gql_result).__name__
+            try:
+                return await self._get_chain(path, params, cache_key, counts=False)
+            except RedditAPIError as exc:
+                raise RedditAPIError(f"graphql:{reason} | {exc}"[:600], status_code=exc.status_code) from None
+
+        post = children[0].get("data") or {}
+        comments = reddit_gql.comments_listing(reddit_gql.comment_trees(gql_result) or [], post)
+        if str(params.get("raw_json", "")) != "1":
+            _escape_bodies(comments)  # the JSON API escapes &, < and > in bodies unless raw_json=1
+        data = [post_result, comments]
+        self._cache.set(cache_key, data)
+        return data
+
+    # ------------------------------------------------------- JSON API chain
+
+    async def _get_chain(self, path: str, params: dict, cache_key: str, counts: bool) -> Any:
+        """One JSON API read through the fallback tiers. `counts`: a refused read counts toward the self-heal restart
+        (listing/search/about reads only; never comments reads or the post read of a comments route)."""
         cached = self._cache.get_fresh(cache_key, config.CACHE_TTL_SECONDS)
         if cached is not None:
             return cached
@@ -298,7 +404,6 @@ class RedditClient:
                 snippet = " ".join(re.sub(r"<[^>]*>|\{[^}]*\}", " ", resp.text or "").split())[:80]
             trail.append(f"{label}:{resp.status_code} {snippet[:80]}".strip())
 
-        counts = not _is_comments_path(path)
         identity_reset = False
         for tier in config.FALLBACK_TIERS:
             for attempt in range(config.MAX_RETRIES_PER_TIER):

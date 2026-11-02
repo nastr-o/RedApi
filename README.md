@@ -105,3 +105,14 @@ security". Following the note in `config.py` (take the current approach from Red
 Verified 2026-10-23: listings, search, subreddit about/rules, `/by_id` and `/duplicates` answer 200. Comment threads
 still answer 403. For development and proof-of-concept use only: low request volume, to be replaced by the official
 Reddit Data API before any launch.
+
+### Comment threads through GraphQL (2026-11-02)
+
+Reddit's edge refuses every comments JSON route for logged-out tokens ("blocked by network security": `/comments/…`,
+`/r/<sub>/comments/…`, `/api/info`, `/api/morechildren`); the `%2F` separator trick stopped working on 2026-10-22.
+Comments routes (`/r/{sub}/comments/{id}`, `/comments/{id}`, and `/raw/…/comments/{id}/{slug}/{comment}.json`) now
+read the post from `/by_id/t3_{id}` and the comments from the Android app's GraphQL API (`gql-fed.reddit.com`,
+persisted query `PostComments`, see `reddit_gql.py`), converted to Reddit's JSON shape `[postListing, commentListing]`
+(t1 things with nested `replies` Listings and `more` stubs). `sort`, `limit` (≤ 200), `depth` (≤ 10) and a focused
+comment (path or `?comment=`) are honoured; `context` is not. When GraphQL fails the old JSON route is tried as
+before. A missing post answers 404. Comments reads never count toward the self-heal restart.
