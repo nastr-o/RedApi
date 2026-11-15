@@ -404,14 +404,11 @@ class RedditClient:
         return result
 
     async def _web_listing(self, subreddit: str, sort: str, params: dict) -> Any:
-        """Up to `limit` posts (≤ 100): the community page, then "more posts" pages, starting after `after`."""
+        """Up to `limit` posts (≤ 100) from "more posts" pages (~24 each), starting after `after`."""
         limit = max(1, min(int(params.get("limit") or 25), 100))
         t = params.get("t")
         after = params.get("after")
-        if after:
-            url, query = reddit_web.listing_more_url(subreddit, sort, t, reddit_web.cursor_for(after))
-        else:
-            url, query = reddit_web.listing_first_url(subreddit, sort, t)
+        url, query = reddit_web.listing_url(subreddit, sort, t, reddit_web.cursor_for(after) if after else None)
         collected: list[dict] = []
         seen: set[str] = set()
         for _ in range(config.WEB_MAX_PAGES):
@@ -423,7 +420,7 @@ class RedditClient:
             cursor = reddit_web.more_cursor(page)
             if len(collected) >= limit or not cursor or not fresh:
                 break
-            url, query = reddit_web.listing_more_url(subreddit, sort, t, cursor)
+            url, query = reddit_web.listing_url(subreddit, sort, t, cursor)
         collected = collected[:limit]
         next_after = collected[-1]["name"] if len(collected) >= limit else None
         return reddit_web.listing(collected, next_after)

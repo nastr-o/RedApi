@@ -257,7 +257,7 @@ REFUSALS_BEFORE_RESTART = 4
 MIN_UPTIME_BEFORE_RESTART = 5 * 60
 
 # Signed-in web reads (reddit_web): page caps per request, so one call can't drain the account's window.
-WEB_MAX_PAGES = 5  # community listing: first page (3 posts) + "more posts" pages (~25 each)
+WEB_MAX_PAGES = 5  # community listing pages (~24 posts each)
 WEB_MAX_SEARCH_PAGES = 4  # search result pages (7 results each)
 WEB_MAX_SEARCH_POSTS = 25  # each search result costs one post page
 WEB_MAX_BY_ID = 10  # post pages per /by_id call

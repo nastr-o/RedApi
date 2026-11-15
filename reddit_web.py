@@ -5,7 +5,7 @@ Why (2026-11-15): Reddit refuses every post-reading JSON/app route (listings, se
 logged-out *and* logged-in app tokens alike ("blocked by network security"), while the normal website still serves a
 signed-in browser. So listings, single posts and threads are read from the pages a browser loads:
 
-- community listing:  /r/{sub}/{sort}/  (3 posts) then /svc/shreddit/community-more-posts/{sort}/?after=… (~25 each)
+- community listing:  /svc/shreddit/community-more-posts/{sort}/?name=…[&after=…]  (~24 posts per page)
 - one post + comments: the post page /r/{sub}/comments/{id}/ (the post, and the first comment batch)
 - search:              /search/?q=…&type=posts  (7 results per page, thin: id, title, author, community)
 
@@ -174,15 +174,13 @@ def parse_listing_path(path: str) -> Optional[tuple[str, str]]:
     return (m.group(1), m.group(2)) if m else None
 
 
-def listing_first_url(subreddit: str, sort: str, t: Optional[str]) -> tuple[str, dict]:
-    params = {"t": t} if sort == "top" and t in _TIME_RANGES else {}
-    return f"{BASE}/r/{subreddit}/{sort}/", params
-
-
-def listing_more_url(subreddit: str, sort: str, t: Optional[str], cursor: str) -> tuple[str, dict]:
-    """The page's own "load more" request: the cursor padded to whole base64, `t` upper-case (DAY unless top)."""
-    cursor = cursor + "=" * (-len(cursor) % 4)
-    params = {"after": cursor, "name": subreddit, "t": t.upper() if sort == "top" and t in _TIME_RANGES else "DAY"}
+def listing_url(subreddit: str, sort: str, t: Optional[str], cursor: Optional[str]) -> tuple[str, dict]:
+    """The website's "load more posts" request, used for every page including the first (no cursor = newest): it
+    returns ~24 posts and accepts the community name in any case, while `/r/<sub>/<sort>/` shows 3 posts and serves an
+    empty shell unless the name's case is exact. The cursor is padded to whole base64; `t` is upper-case (DAY unless top)."""
+    params = {"name": subreddit, "t": t.upper() if sort == "top" and t in _TIME_RANGES else "DAY"}
+    if cursor:
+        params["after"] = cursor + "=" * (-len(cursor) % 4)
     return f"{BASE}/svc/shreddit/community-more-posts/{sort}/", params
 
 

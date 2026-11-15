@@ -67,10 +67,10 @@ class PostsTest(unittest.TestCase):
     def test_cursor(self):
         self.assertEqual(w.more_cursor(POST), "dDNfYWJjMTIz")
         self.assertEqual(w.cursor_for("t3_abc123"), "dDNfYWJjMTIz")
-        _, params = w.listing_more_url("SaaS", "new", None, "dDNfMXh3emw0MA")
-        self.assertEqual(params, {"after": "dDNfMXh3emw0MA==", "name": "SaaS", "t": "DAY"})
-        _, params = w.listing_more_url("SaaS", "top", "month", "x")
-        self.assertEqual(params["t"], "MONTH")
+        url, params = w.listing_url("saas", "new", None, "dDNfMXh3emw0MA")
+        self.assertEqual(url, "https://www.reddit.com/svc/shreddit/community-more-posts/new/")
+        self.assertEqual(params, {"after": "dDNfMXh3emw0MA==", "name": "saas", "t": "DAY"})
+        self.assertEqual(w.listing_url("SaaS", "top", "month", None)[1], {"name": "SaaS", "t": "MONTH"})
 
     def test_listing_path(self):
         self.assertEqual(w.parse_listing_path("/r/SaaS/new.json"), ("SaaS", "new"))
