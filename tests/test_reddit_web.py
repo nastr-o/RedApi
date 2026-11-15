@@ -52,6 +52,12 @@ class PostsTest(unittest.TestCase):
         self.assertFalse(p["over_18"] or p["locked"])
         self.assertEqual(p["selftext"], "First line with a link .\n\nNested & para")
 
+    def test_no_nulls(self):
+        for post in w.posts(POST):
+            self.assertNotIn(None, post.values(), post)
+        _, comments = w.thread(THREAD, "abc123")
+        self.assertNotIn(None, comments["data"]["children"][0]["data"].values())
+
     def test_flags(self):
         pic = w.posts(POST)[1]
         self.assertTrue(pic["over_18"] and pic["locked"])

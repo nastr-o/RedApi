@@ -91,6 +91,12 @@ def _body(page: str, fullname: str, kind: str) -> str:
     return html_to_text(_balanced_div(page, m.start())) if m else ""
 
 
+def _present(fields: dict) -> dict:
+    """Fields without a value are left out, as the JSON API omits them: consumers' schemas (DemandLark's zod) accept a
+    missing optional field but not null."""
+    return {k: v for k, v in fields.items() if v is not None}
+
+
 def post_from_tag(tag: str, page: str) -> Optional[dict]:
     """One <shreddit-post> as a JSON API t3 `data` dict."""
     a = attrs(tag)
@@ -101,7 +107,7 @@ def post_from_tag(tag: str, page: str) -> Optional[dict]:
     permalink = a.get("permalink", "")
     subreddit = a.get("subreddit-name") or a.get("subreddit-prefixed-name", "").removeprefix("r/")
     verdict = a.get("moderation-verdict", "")
-    return {
+    return _present({
         "id": fullname[3:],
         "name": fullname,
         "title": a.get("post-title", ""),
@@ -127,9 +133,8 @@ def post_from_tag(tag: str, page: str) -> Optional[dict]:
         "removed_by_category": verdict.lower() if verdict.lower() in ("removed", "mod_removed", "admin_removed") else None,
         "distinguished": a.get("distinguished") or None,
         "crosspost_parent": a.get("crosspost-parent-id") or ("crosspost" if post_type == "crosspost" else None),
-        "link_flair_text": None,
         "post_hint": post_type or None,
-    }
+    })
 
 
 def posts(page: str) -> list[dict]:
@@ -191,7 +196,7 @@ def comments(page: str, post_id: str) -> list[dict]:
         thing = a.get("thingId", "")
         if not thing.startswith("t1_"):
             continue
-        flat.append({
+        flat.append(_present({
             "id": thing[3:],
             "name": thing,
             "parent_id": a.get("parentId") or f"t3_{post_id}",
@@ -203,7 +208,7 @@ def comments(page: str, post_id: str) -> list[dict]:
             "depth": _int(a.get("depth")),
             "permalink": a.get("permalink") or None,
             "replies": "",
-        })
+        }))
     by_name = {c["name"]: c for c in flat}
     roots: list[dict] = []
     for c in flat:
