@@ -14,10 +14,13 @@ Then e.g.:
     curl "http://localhost:8080/search?q=rust&subreddit=programming"
 """
 
+import hmac
+import os
 from contextlib import asynccontextmanager
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.responses import JSONResponse
 
 from reddit_client import RedditAPIError, reddit_client
 
@@ -37,6 +40,18 @@ app = FastAPI(
     version="0.1.0",
     lifespan=lifespan,
 )
+
+
+@app.middleware("http")
+async def require_key(request: Request, call_next):
+    """With REDAPI_KEY set, every route but /health needs `x-api-key` (DemandLark's scanner and app send it): reads
+    now spend a signed-in account's window, so strangers must not be able to use this public address."""
+    expected = os.environ.get("REDAPI_KEY", "")
+    if expected and request.url.path != "/health":
+        given = request.headers.get("x-api-key", "")
+        if not hmac.compare_digest(given.encode(), expected.encode()):
+            return JSONResponse({"detail": "unauthorized"}, status_code=401)
+    return await call_next(request)
 
 
 async def _fetch(path: str, params: Optional[dict] = None):
