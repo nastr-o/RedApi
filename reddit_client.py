@@ -168,6 +168,7 @@ class RedditClient:
         return {
             "refusedInARow": self._refused_in_a_row,
             "tokenFlow": token.flow if token else None,
+            "sessionConfigured": bool(config.REDDIT_SESSION_COOKIE),
             "uptimeSeconds": int(time.monotonic() - self._started),
         }
 
@@ -180,12 +181,37 @@ class RedditClient:
         self._client_id_index += 1
 
     async def _fetch_token(self, client_id: str) -> _Token:
-        """Logged-out token the way Redlib gets it today: the Android app's loid endpoint first, the older
-        installed_client grant as a fallback."""
+        """A logged-in app token from the session cookie when one is configured; otherwise (or if that fails) the
+        logged-out token the way Redlib gets it: the Android app's loid endpoint, then the older installed_client grant."""
+        if config.REDDIT_SESSION_COOKIE:
+            try:
+                return await self._fetch_session_token(client_id)
+            except (RedditAPIError, RequestException, ValueError, KeyError) as exc:
+                print(f"redapi: session token failed ({type(exc).__name__}: {str(exc)[:80]}); logged-out token", flush=True)
         try:
             return await self._fetch_loid_token(client_id)
         except (RedditAPIError, RequestException, ValueError, KeyError):
             return await self._fetch_installed_client_token(client_id)
+
+    async def _fetch_session_token(self, client_id: str) -> _Token:
+        resp = await self._http.post(
+            config.SESSION_TOKEN_URL,
+            headers={**self._app_headers, "Cookie": f"reddit_session={config.REDDIT_SESSION_COOKIE}"},
+            auth=(client_id, ""),
+            data=json.dumps({"scopes": ["*", "email", "pii"]}),
+        )
+        if resp.status_code != 200:
+            raise RedditAPIError(f"session token request failed ({resp.status_code})", status_code=resp.status_code)
+        payload = resp.json()
+        self._session_headers = {
+            name: resp.headers[name] for name in ("x-reddit-loid", "x-reddit-session") if resp.headers.get(name)
+        }
+        return _Token(
+            value=payload["access_token"],
+            expires_in=payload.get("expires_in", config.TOKEN_LIFETIME_SECONDS),
+            client_id=client_id,
+            flow="session",
+        )
 
     async def _fetch_loid_token(self, client_id: str) -> _Token:
         resp = await self._http.post(
@@ -274,8 +300,12 @@ class RedditClient:
         return resp
 
     async def _request_public_json(self, base: str, path: str, params: dict) -> cffi.Response:
-        headers = {"User-Agent": random.choice(config.DESKTOP_USER_AGENTS)}
         url = f"{base}{path}"
+        if config.REDDIT_SESSION_COOKIE:
+            # Signed in as a browser: keep the TLS profile's own User-Agent (a mismatched one is refused) and send
+            # the session cookie. Reddit answers about/rules and comments this way; listings and search stay refused.
+            return await self._http.get(url, params=params, cookies={"reddit_session": config.REDDIT_SESSION_COOKIE})
+        headers = {"User-Agent": random.choice(config.DESKTOP_USER_AGENTS)}
         return await self._http.get(url, params=params, headers=headers)
 
     async def _request_tier(self, tier: dict, path: str, params: dict) -> cffi.Response:

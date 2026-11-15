@@ -26,6 +26,7 @@ IMPORTANT — read before deploying:
     that's on you to review for your use case.
 """
 
+import os
 import random
 import uuid
 
@@ -228,6 +229,10 @@ DESKTOP_USER_AGENTS = [
 OAUTH_TOKEN_URL = "https://www.reddit.com/api/v1/access_token"
 # The Android app's current logged-out token endpoint (what Redlib's MobileSpoofAuth uses, src/oauth.rs).
 LOID_TOKEN_URL = "https://www.reddit.com/auth/v2/oauth/access-token/loid"
+# Logged-in app token minted from a `reddit_session` cookie (what Nachtalb/redlib does since Reddit's 2026-11 lockout).
+SESSION_TOKEN_URL = "https://www.reddit.com/auth/v2/oauth/access-token/session"
+# `reddit_session` cookie of a separate throwaway account (env only, never logged). Unset = logged-out reads as before.
+REDDIT_SESSION_COOKIE = os.environ.get("REDDIT_SESSION_COOKIE", "").strip()
 
 # TLS fingerprints to present (curl_cffi impersonation targets). Reddit's edge blocks non-browser handshakes; Redlib
 # emulates Chrome/Firefox for the same reason (src/client.rs).
