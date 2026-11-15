@@ -50,6 +50,7 @@ from curl_cffi.requests.exceptions import RequestException
 
 import config
 import reddit_gql
+import reddit_web
 from cache import TTLCache
 
 
@@ -122,6 +123,7 @@ class RedditClient:
         # Listing/search/about reads refused on the oauth tier in a row (each after a fresh identity); see _self_heal.
         self._refused_in_a_row = 0
         self._exit_scheduled = False
+        self._web_remaining: Optional[str] = None  # x-ratelimit-remaining of the last web page load
         self._new_identity()
 
     def _new_identity(self) -> None:
@@ -169,6 +171,7 @@ class RedditClient:
             "refusedInARow": self._refused_in_a_row,
             "tokenFlow": token.flow if token else None,
             "sessionConfigured": bool(config.REDDIT_SESSION_COOKIE),
+            "webRateRemaining": self._web_remaining,
             "uptimeSeconds": int(time.monotonic() - self._started),
         }
 
@@ -326,9 +329,155 @@ class RedditClient:
             return cached
 
         thread = reddit_gql.parse_thread_path(path)
+        if config.REDDIT_SESSION_COOKIE:
+            # Signed in: post data comes from Reddit's web pages (every JSON/app post route is refused, 2026-11-15).
+            web = await self._web_route(path, params, thread)
+            if web is not None:
+                self._cache.set(cache_key, web)
+                return web
         if thread is not None:
             return await self._get_thread(path, params, thread, cache_key)
         return await self._get_chain(path, params, cache_key, counts=not _is_comments_path(path))
+
+    # ------------------------------------------------------------ web pages
+
+    async def _web_get(self, url: str, params: Optional[dict] = None) -> str:
+        """One signed-in page load. Raises RedditAPIError with the status (403 for the block page, 404 for a missing
+        page). A 429 waits for Retry-After once. Logs when the account's window runs low."""
+        for attempt in range(2):
+            try:
+                # Redirects are followed (a post URL without its slug redirects to the full one); a login page means
+                # the session is gone.
+                resp = await self._http.get(url, params=params or {}, allow_redirects=True, max_redirects=3,
+                                            cookies={"reddit_session": config.REDDIT_SESSION_COOKIE})
+            except RequestException as exc:
+                if attempt == 0:
+                    await asyncio.sleep(config.BACKOFF_BASE_SECONDS)
+                    continue
+                raise RedditAPIError(f"web: transport {type(exc).__name__}") from None
+            remaining = resp.headers.get("x-ratelimit-remaining")
+            self._web_remaining = remaining
+            try:
+                if remaining is not None and float(remaining) < 20:
+                    print(f"redapi: web window low ({remaining} left, resets in {resp.headers.get('x-ratelimit-reset')} s)", flush=True)
+            except ValueError:
+                pass
+            if resp.status_code == 429 and attempt == 0:
+                await asyncio.sleep(min(float(resp.headers.get("retry-after") or 5), 30))
+                continue
+            text = resp.text or ""
+            if "/login" in str(getattr(resp, "url", "") or ""):
+                raise RedditAPIError("web: login redirect (session expired?)", status_code=403)
+            if resp.status_code == 200 and "blocked by network security" not in text.lower():
+                return text
+            if resp.status_code in (301, 302, 303, 307, 308):
+                location = resp.headers.get("location", "")
+                if "login" in location:
+                    raise RedditAPIError("web: login redirect (session expired?)", status_code=403)
+                raise RedditAPIError(f"web: {resp.status_code} redirect", status_code=404)
+            status = resp.status_code if resp.status_code != 200 else 403
+            raise RedditAPIError(f"web: {status}" + (" blocked" if status == 403 else ""), status_code=status)
+        raise RedditAPIError("web: 429 rate limited", status_code=429)
+
+    async def _web_route(self, path: str, params: dict, thread: Optional[dict]) -> Any:
+        """Post reads served from the website, or None to use the JSON chain (about, rules and anything else, which
+        Reddit still answers there). A refused listing/search counts toward the self-heal restart."""
+        try:
+            listing = reddit_web.parse_listing_path(path)
+            if listing is not None:
+                result = await self._web_listing(*listing, params)
+            elif thread is not None:
+                result = await self._web_thread(thread, params)
+            elif path.startswith("/by_id/"):
+                result = await self._web_by_id(path)
+            elif path in ("/search.json",) or re.match(r"^/r/[A-Za-z0-9_]+/search\.json$", path):
+                result = await self._web_search(path, params)
+            else:
+                return None
+        except RedditAPIError as exc:
+            if exc.status_code == 403 and thread is None:
+                self._refused_in_a_row += 1
+                self._self_heal()
+            raise
+        if thread is None:
+            self._refused_in_a_row = 0
+        return result
+
+    async def _web_listing(self, subreddit: str, sort: str, params: dict) -> Any:
+        """Up to `limit` posts (≤ 100): the community page, then "more posts" pages, starting after `after`."""
+        limit = max(1, min(int(params.get("limit") or 25), 100))
+        t = params.get("t")
+        after = params.get("after")
+        if after:
+            url, query = reddit_web.listing_more_url(subreddit, sort, t, reddit_web.cursor_for(after))
+        else:
+            url, query = reddit_web.listing_first_url(subreddit, sort, t)
+        collected: list[dict] = []
+        seen: set[str] = set()
+        for _ in range(config.WEB_MAX_PAGES):
+            page = await self._web_get(url, query)
+            fresh = [p for p in reddit_web.posts(page) if p["name"] not in seen]
+            for p in fresh:
+                seen.add(p["name"])
+            collected.extend(fresh)
+            cursor = reddit_web.more_cursor(page)
+            if len(collected) >= limit or not cursor or not fresh:
+                break
+            url, query = reddit_web.listing_more_url(subreddit, sort, t, cursor)
+        collected = collected[:limit]
+        next_after = collected[-1]["name"] if len(collected) >= limit else None
+        return reddit_web.listing(collected, next_after)
+
+    async def _web_thread(self, thread: dict, params: dict) -> Any:
+        post_id, comment_id, sub = thread["post_id"], thread["comment_id"], thread.get("subreddit")
+        url = reddit_web.post_url(post_id, comment_id, sub)
+        sort = str(params.get("sort") or "")
+        query = {"sort": sort} if sort and sort not in ("confidence", "best") else {}
+        page = await self._web_get(url, query)
+        data = reddit_web.thread(page, post_id)
+        if data is None:
+            raise RedditAPIError(f"post {post_id} not found", status_code=404)
+        return data
+
+    async def _web_posts(self, post_ids: list[str]) -> list[dict]:
+        """Post pages for these ids, WEB_CONCURRENCY at a time, in order; missing posts (404) are left out."""
+        gate = asyncio.Semaphore(config.WEB_CONCURRENCY)
+
+        async def one(post_id: str) -> Optional[dict]:
+            async with gate:
+                try:
+                    page = await self._web_get(reddit_web.post_url(post_id))
+                except RedditAPIError as exc:
+                    if exc.status_code == 404:
+                        return None
+                    raise
+            return next((p for p in reddit_web.posts(page) if p["id"] == post_id), None)
+
+        results = await asyncio.gather(*(one(i) for i in post_ids))
+        return [p for p in results if p]
+
+    async def _web_by_id(self, path: str) -> Any:
+        """/by_id/t3_a,t3_b.json: one post page per id (at most WEB_MAX_BY_ID)."""
+        names = [n for n in path[len("/by_id/"):].removesuffix(".json").split(",") if n.startswith("t3_")]
+        return reddit_web.listing(await self._web_posts([n[3:] for n in names[: config.WEB_MAX_BY_ID]]), None)
+
+    async def _web_search(self, path: str, params: dict) -> Any:
+        """Search results (7 per page, thin) filled in from each result's post page, up to WEB_MAX_SEARCH_POSTS."""
+        subreddit = path.split("/")[2] if path.startswith("/r/") else None
+        limit = max(1, min(int(params.get("limit") or 25), config.WEB_MAX_SEARCH_POSTS))
+        hits: list[dict] = []
+        cursor: Optional[str] = None
+        for _ in range(config.WEB_MAX_SEARCH_PAGES):
+            url, query = reddit_web.search_url(str(params.get("q") or ""), str(params.get("sort") or "relevance"),
+                                               params.get("t"), subreddit, cursor)
+            page = await self._web_get(url, query)
+            fresh = [h for h in reddit_web.search_hits(page) if h["id"] not in {x["id"] for x in hits}]
+            hits.extend(h for h in fresh if not h["nsfw"])
+            cursor = reddit_web.search_cursor(page)
+            if len(hits) >= limit or not cursor or not fresh:
+                break
+        found = await self._web_posts([h["id"] for h in hits[:limit]])
+        return reddit_web.listing(found, None)
 
     # --------------------------------------------------------- comment threads
 

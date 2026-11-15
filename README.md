@@ -116,3 +116,21 @@ persisted query `PostComments`, see `reddit_gql.py`), converted to Reddit's JSON
 (t1 things with nested `replies` Listings and `more` stubs). `sort`, `limit` (≤ 200), `depth` (≤ 10) and a focused
 comment (path or `?comment=`) are honoured; `context` is not. When GraphQL fails the old JSON route is tried as
 before. A missing post answers 404. Comments reads never count toward the self-heal restart.
+
+### Signed-in web reads (2026-11-15)
+
+Reddit now refuses every post-reading JSON and app route (listings, search, `/by_id`, comments, GraphQL) with the
+"blocked by network security" page, for logged-out tokens and for app tokens minted from a logged-in session alike;
+only community `/about` and rules still answer. The normal website still serves a signed-in browser. With
+`REDDIT_SESSION_COOKIE` set (the `reddit_session` cookie of a separate throwaway account; env only, never logged),
+`reddit_web.py` reads listings, single posts, threads and search from those pages and converts them to the JSON shape:
+
+| Route | Pages loaded |
+| --- | --- |
+| `/r/{sub}/{new,top,hot}` (`limit`, `after`, `t`) | the community page (3 posts), then "more posts" pages (~25 each), at most 5 |
+| `/comments/{id}`, `/r/{sub}/comments/{id}`, focused comment | the post page (the post and the first batch of comments) |
+| `/by_id/t3_…` | one post page per id (≤ 10, 4 at a time) |
+| `/search` | result pages (7 each, ≤ 4), then one post page per result (≤ 25, 4 at a time) |
+
+The account's web window is about 600 page loads per 10 minutes (`x-ratelimit-*` headers; `/health?deep=1` shows
+`webRateRemaining`). About/rules keep using the JSON route (with the cookie). Tests: `python -m unittest discover -s tests`.
