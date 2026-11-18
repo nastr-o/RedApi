@@ -124,6 +124,7 @@ class RedditClient:
         self._refused_in_a_row = 0
         self._exit_scheduled = False
         self._web_remaining: Optional[str] = None  # x-ratelimit-remaining of the last web page load
+        self._on_spare = False  # survives identity resets: the main session stays logged out
         self._new_identity()
 
     def _new_identity(self) -> None:
@@ -171,6 +172,8 @@ class RedditClient:
             "refusedInARow": self._refused_in_a_row,
             "tokenFlow": token.flow if token else None,
             "sessionConfigured": bool(config.REDDIT_SESSION_COOKIE),
+            "session": "spare" if self._on_spare else "main",
+            "spareConfigured": bool(config.REDDIT_SESSION_COOKIE_SPARE),
             "webRateRemaining": self._web_remaining,
             "uptimeSeconds": int(time.monotonic() - self._started),
         }
@@ -366,6 +369,10 @@ class RedditClient:
                 await asyncio.sleep(min(float(resp.headers.get("retry-after") or 5), 30))
                 continue
             text = resp.text or ""
+            login = "/login" in str(getattr(resp, "url", "") or "") or (
+                resp.status_code in (301, 302, 303, 307, 308) and "login" in resp.headers.get("location", ""))
+            if login and attempt == 0 and self._switch_to_spare():
+                continue
             if "/login" in str(getattr(resp, "url", "") or ""):
                 raise RedditAPIError("web: login redirect (session expired?)", status_code=403)
             if resp.status_code == 200 and "blocked by network security" not in text.lower():
@@ -378,6 +385,17 @@ class RedditClient:
             status = resp.status_code if resp.status_code != 200 else 403
             raise RedditAPIError(f"web: {status}" + (" blocked" if status == 403 else ""), status_code=status)
         raise RedditAPIError("web: 429 rate limited", status_code=429)
+
+    def _switch_to_spare(self) -> bool:
+        """The main session was logged out: use the spare account's session from now on (once per process)."""
+        if self._on_spare or not config.REDDIT_SESSION_COOKIE_SPARE:
+            return False
+        self._on_spare = True
+        config.REDDIT_SESSION_COOKIE = config.REDDIT_SESSION_COOKIE_SPARE
+        self._token = None  # the app token was minted from the old session
+        self._session_headers = {}
+        print("redapi: main session got a login redirect; switched to the spare session", flush=True)
+        return True
 
     async def _web_route(self, path: str, params: dict, thread: Optional[dict]) -> Any:
         """Post reads served from the website, or None to use the JSON chain (about, rules and anything else, which

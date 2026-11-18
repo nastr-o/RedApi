@@ -233,6 +233,9 @@ LOID_TOKEN_URL = "https://www.reddit.com/auth/v2/oauth/access-token/loid"
 SESSION_TOKEN_URL = "https://www.reddit.com/auth/v2/oauth/access-token/session"
 # `reddit_session` cookie of a separate throwaway account (env only, never logged). Unset = logged-out reads as before.
 REDDIT_SESSION_COOKIE = os.environ.get("REDDIT_SESSION_COOKIE", "").strip()
+# Optional `reddit_session` of a second throwaway account. When the first session hits a login redirect (logged out,
+# suspended), reads switch to this one once and carry on; /health?deep=1 says which one is in use.
+REDDIT_SESSION_COOKIE_SPARE = os.environ.get("REDDIT_SESSION_COOKIE_SPARE", "").strip()
 
 # TLS fingerprints to present (curl_cffi impersonation targets). Reddit's edge blocks non-browser handshakes; Redlib
 # emulates Chrome/Firefox for the same reason (src/client.rs).
