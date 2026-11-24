@@ -74,7 +74,8 @@ def html_to_text(fragment: str) -> str:
     text = re.sub(r"<(script|style)\b.*?</\1>", " ", fragment, flags=re.S | re.I)
     text = re.sub(r"<br\s*/?>", "\n", text, flags=re.I)
     text = re.sub(r"</(p|li|h[1-6]|blockquote|pre|tr)>", "\n\n", text, flags=re.I)
-    text = re.sub(r"<li\b[^>]*>", "- ", text, flags=re.I)
+    # Reddit wraps each item's text in a paragraph (<li><p>…): the marker and the words belong on one line.
+    text = re.sub(r"<li\b[^>]*>\s*(?:<p\b[^>]*>\s*)?", "- ", text, flags=re.I)
     text = re.sub(r"<[^>]+>", " ", text)
     text = htmllib.unescape(text)
     lines = [" ".join(line.split()) for line in text.split("\n")]

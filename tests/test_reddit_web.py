@@ -107,3 +107,9 @@ class SearchTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ListItems(unittest.TestCase):
+    def test_a_list_item_keeps_its_marker_on_the_same_line(self):
+        html = "<p>Need:</p><ul>\n<li>\n<p>Client onboarding</p>\n</li>\n<li><p>Invoices</p></li>\n<li>plain</li></ul><p>Thanks</p>"
+        self.assertEqual(w.html_to_text(html), "Need:\n\n- Client onboarding\n\n- Invoices\n\n- plain\n\nThanks")
