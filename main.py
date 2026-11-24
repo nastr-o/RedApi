@@ -47,7 +47,13 @@ async def require_key(request: Request, call_next):
     """With REDAPI_KEY set, every route but /health needs `x-api-key` (DemandLark's scanner and app send it): reads
     now spend a signed-in account's window, so strangers must not be able to use this public address."""
     expected = os.environ.get("REDAPI_KEY", "")
-    if expected and request.url.path != "/health":
+    # The plain /health (no Reddit read) stays open: it is the wake ping. /health?deep=1 reads Reddit on the account's
+    # session, so it needs the key like every other route.
+    deep = request.url.path == "/health" and request.query_params.get("deep", "").lower() not in ("", "0", "false", "no", "off")
+    if request.url.path != "/health" or deep:
+        # Without a key configured nothing is served (fail closed), instead of serving everyone.
+        if not expected:
+            return JSONResponse({"detail": "not_configured"}, status_code=503)
         given = request.headers.get("x-api-key", "")
         if not hmac.compare_digest(given.encode(), expected.encode()):
             return JSONResponse({"detail": "unauthorized"}, status_code=401)
